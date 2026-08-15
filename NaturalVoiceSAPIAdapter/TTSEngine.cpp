@@ -9,6 +9,9 @@
 #include "RegKey.h"
 #include "wrappers.h"
 
+// 【新增】初始化全局静态锁
+std::mutex CTTSEngine::s_globalSynthMutex;
+
 // CTTSEngine
 
 // GetTickCount() is deprecated and can overflow every 49 days.
@@ -85,8 +88,9 @@ STDMETHODIMP CTTSEngine::Speak(DWORD /*dwSpeakFlags*/,
             return SPERR_UNINITIALIZED;
         }
 
-        // 【修复 1】获取实例锁，确保同一个引擎实例的朗读和取消严格串行，防止 SDK 状态机错乱
-        std::unique_lock<std::mutex> lock(m_speakMutex);
+        // 【修复 1】获取全局进程锁，彻底杜绝 x86 下多实例并发导致的 ONNX 状态机错乱和杂音
+        // 替代原有的实例级 m_speakMutex
+        std::unique_lock<std::mutex> lock(s_globalSynthMutex);
 
         if (m_lastCancellingFuture.valid())
         {
@@ -392,7 +396,7 @@ bool CTTSEngine::InitCloudVoiceSynthesizer(ISpDataKey* pConfigKey)
     {
         auto url = ParseUrl(proxy);
         uint32_t port = 80;
-        std::from_chars(url.port.data(), url.port.data() + url.port.size(), port);
+        std::from_chars(url.port.data(), url.port.data() + url.size(), port);
         config->SetProxy(std::string(url.host), port);
     }
 
@@ -473,38 +477,38 @@ static size_t GetTrailingSilenceLengthMono(BYTE* waveData, size_t length)
     return length;
 }
 
+// 【核心修复 3】重写 OnAudioData：实现带退避重试的阻塞式写入
+// 解决 x86 下 SAPI 宿主缓冲区满导致 Write 失败，进而导致 SDK 误判中断和杂音的问题
 int CTTSEngine::OnAudioData(uint8_t* data, uint32_t len)
 {
     std::lock_guard lock(m_outputSiteMutex);
-    if (!m_pOutputSite)
+    if (!m_pOutputSite || len == 0 || data == nullptr)
     {
-        LogWarn("Speak: Audio write with invalid OutputSite, ignored");
-        return len; // ignore the data
+        return len; 
     }
 
+    ULONG safeLen = static_cast<ULONG>(len);
     ULONG written = 0;
 
+    // --- 原有的在线延迟优化逻辑 (本地语音通常不走这里，保留原样) ---
     if (m_onlineDelayOptimization)
     {
         if (!m_compensatedSilenceWritten)
         {
             DWORD currentTicks = _GetTickCount();
-            DWORD passedMs = currentTicks - m_thisSpeakStartedTicks;  // delay of this connection
+            DWORD passedMs = currentTicks - m_thisSpeakStartedTicks;  
             LogDebug("Speak: Connection delay: {}ms", passedMs);
-            // Speak() usually returns before the audio finishes.
-            // Therefore, if the previous Speak() ends no more than 5 seconds ago,
-            // we will compensate for the full silence duration
+            
             if (m_lastSpeakCompletedTicks != 0 && currentTicks - m_lastSpeakCompletedTicks < 5000)
             {
-                // Compensate for the previous removed trailing silence
-                DWORD silenceMs = m_lastSilentBytes / nWaveBytesPerMSec;  // last slience duration
+                DWORD silenceMs = m_lastSilentBytes / nWaveBytesPerMSec;  
                 m_compensatedSilentBytes = silenceMs > passedMs ? (silenceMs - passedMs) * nWaveBytesPerMSec : 0;
 
                 if (m_compensatedSilentBytes != 0)
                 {
                     LogDebug("Speak: Compensate for the previous trailing {}ms silence", silenceMs - passedMs);
-                    // Write the compensated silence
-                    auto mem = std::make_unique<BYTE[]>(m_compensatedSilentBytes);  // zeroed mem
+                    auto mem = std::make_unique<BYTE[]>(m_compensatedSilentBytes);  
+                    memset(mem.get(), 0, m_compensatedSilentBytes); // 显式清零防杂音
                     m_pOutputSite->Write(mem.get(), m_compensatedSilentBytes, &written);
                 }
             }
@@ -513,42 +517,74 @@ int CTTSEngine::OnAudioData(uint8_t* data, uint32_t len)
         }
 
         // assume 16bit mono
-        ULONG silentBytes = (ULONG)GetTrailingSilenceLengthMono<USHORT>(data, len);
-        if (silentBytes == len)
+        ULONG silentBytes = static_cast<ULONG>(GetTrailingSilenceLengthMono<USHORT>(data, safeLen));
+        if (silentBytes == safeLen)
         {
-            // This chunk is completely silent
-            // Hold the silence data for no more than a second
             if (m_lastSilentBytes < nWaveBytesPerMSec * 1000)
             {
-                // Hold and accumulate the silence length
                 m_lastSilentBytes += silentBytes;
                 return len;
             }
         }
         else
         {
-            // This chunk is not completely silent, so send the previous silent data
             if (m_lastSilentBytes != 0)
             {
-                auto mem = std::make_unique<BYTE[]>(m_lastSilentBytes);  // zeroed mem
+                auto mem = std::make_unique<BYTE[]>(m_lastSilentBytes);  
+                memset(mem.get(), 0, m_lastSilentBytes);
                 m_pOutputSite->Write(mem.get(), m_lastSilentBytes, &written);
             }
             m_lastSilentBytes = silentBytes;
         }
+        
+        // 更新实际要写入的数据长度（减去尾部静音）
+        safeLen = safeLen - silentBytes;
+        if (safeLen == 0) return len;
     }
 
-    HRESULT hr = m_pOutputSite->Write(data, len - m_lastSilentBytes, &written);
-    // Assumes that the data can be either entirely written or not written at all
-    // because some implementations do not set the written bytes correctly
-    if (SUCCEEDED(hr))
-        return len;
-    else
+    // --- 【核心修复】阻塞式重试写入机制 ---
+    uint8_t* pData = data;
+    ULONG remaining = safeLen;
+
+    while (remaining > 0)
     {
-        if (logger.should_log(spdlog::level::debug))
-            LogDebug("Speak: Could not write {} bytes of audio data, {}", len, std::system_error(hr, sapi_category()));
-        return 0;
+        // 1. 必须时刻检查 SAPI 宿主是否要求中止 (如用户点击了停止)
+        if (m_pOutputSite->GetActions() & SPVES_ABORT)
+        {
+            return 0; // 告诉 SDK 流已关闭，正常停止
+        }
+
+        written = 0;
+        HRESULT hr = m_pOutputSite->Write(pData, remaining, &written);
+
+        if (SUCCEEDED(hr))
+        {
+            if (written == 0 && remaining > 0)
+            {
+                // 宿主没报错但也没写数据，说明缓冲区满了。
+                // 稍作等待 (退避)，让宿主有时间播放和清空缓冲区，然后重试。
+                Sleep(5); 
+                continue;
+            }
+            pData += written;
+            remaining -= written;
+        }
+        else if (hr == SPERR_AUDIO_STOPPED || hr == E_FAIL)
+        {
+            // 宿主明确发送了停止信号或发生致命错误
+            return 0; 
+        }
+        else
+        {
+            // 其他偶发错误，稍作等待重试，绝不轻易返回 0 导致 SDK 崩溃
+            Sleep(5);
+        }
     }
+
+    // 成功将所有数据安全喂给 SAPI 宿主
+    return len; 
 }
+
 void CTTSEngine::OnBookmark(uint64_t offsetTicks, const std::wstring& bookmark)
 {
     std::lock_guard lock(m_outputSiteMutex);
@@ -1088,7 +1124,7 @@ bool CTTSEngine::BuildSSML(const SPVTEXTFRAG* pTextFragList)
         if (pNextTextFrag)
         {
             auto& curState = pTextFrag->State;
-            auto& nextState = pNextTextFrag->State;
+            auto& nextState = pTextFrag->State;
 
             bool sameProsody = (curState.Volume == nextState.Volume
                 && curState.RateAdj == nextState.RateAdj
