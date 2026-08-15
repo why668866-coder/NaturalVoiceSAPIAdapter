@@ -125,6 +125,7 @@ private: // Member variables
 	std::future<void> m_lastCancellingFuture;
 	
 	std::mutex m_speakMutex; // 👈 新增：保护同一个引擎实例的朗读和取消严格串行，防止 ONNX 状态机错乱
+	static std::mutex s_globalSynthMutex; 
 
 	ErrorMode m_errorMode = ErrorMode::ProbeForError;
 	bool m_isEdgeVoice = false;
