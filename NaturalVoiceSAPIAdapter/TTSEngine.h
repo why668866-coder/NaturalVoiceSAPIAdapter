@@ -1,4 +1,4 @@
-﻿// TTSEngine.h: CTTSEngine 的声明
+// TTSEngine.h: CTTSEngine 的声明
 
 #pragma once
 #include "resource.h"       // 主符号
@@ -9,6 +9,7 @@
 #include "Logger.h"
 #include "SapiException.h"
 #include "Mp3Decoder.h"
+#include <mutex>            // 👈 新增：用于保护 Speak 和 Cancel 的串行执行
 
 #include "NaturalVoiceSAPIAdapter_i.h"
 
@@ -122,6 +123,8 @@ private: // Member variables
 	std::shared_ptr<SpeechSynthesizer> m_synthesizer;
 	std::unique_ptr<SpeechRestAPI> m_restApi;
 	std::future<void> m_lastCancellingFuture;
+	
+	std::mutex m_speakMutex; // 👈 新增：保护同一个引擎实例的朗读和取消严格串行，防止 ONNX 状态机错乱
 
 	ErrorMode m_errorMode = ErrorMode::ProbeForError;
 	bool m_isEdgeVoice = false;
