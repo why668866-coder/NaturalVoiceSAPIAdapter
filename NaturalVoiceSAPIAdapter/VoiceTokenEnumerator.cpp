@@ -12,6 +12,8 @@
 #include "RegKey.h"
 #include "SapiException.h"
 #include "Logger.h"
+#include <fstream>   // 新增：用于读取 license/key 文件
+#include <iterator>  // 新增：用于 std::istreambuf_iterator
 
 // CVoiceTokenEnumerator
 inline static void CheckHr(HRESULT hr)
@@ -286,6 +288,27 @@ static std::wstring GetVoiceAge(const std::string& shortName)
     return UTF8ToWString(age->get<std::string>());
 }
 
+// 读取凭证文件并去除末尾的空白字符
+static std::wstring ReadCredentialFile(const std::wstring& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    std::string s{ std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>() };
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
+    return s.empty() ? std::wstring{} : UTF8ToWString(s);
+}
+
+// 解析语音凭证：优先读取 SynthModel.license，其次读取 SynthModel.key，最后回退到内置的 MS_TTS_KEY
+static std::pair<std::wstring, std::wstring> ResolveVoiceCredential(const std::wstring& voiceFolder)
+{
+    if (auto lic = ReadCredentialFile(voiceFolder + L"\\SynthModel.license"); !lic.empty())
+        return { L"License", std::move(lic) };
+    if (auto key = ReadCredentialFile(voiceFolder + L"\\SynthModel.key"); !key.empty())
+        return { L"Key", std::move(key) };
+    return { L"Key", MS_TTS_KEY };
+}
+
 static std::shared_ptr<DataKeyData> MakeLocalVoiceToken(
     const VoiceInfo& voiceInfo,
     ErrorMode errorMode = ErrorMode::ProbeForError,
@@ -301,6 +324,9 @@ static std::shared_ptr<DataKeyData> MakeLocalVoiceToken(
     std::wstring path = UTF8ToWString(voiceInfo.VoicePath);
     if (!path.empty() && (path.back() == '/' || path.back() == '\\'))
         path.erase(path.size() - 1); // Remove the trailing slash
+
+    // 在 path 被 std::move 之前，解析该语音专属的凭证
+    auto [credName, credValue] = ResolveVoiceCredential(path);
 
     // from the last backslash '\' to the first underscore '_'
     size_t name_start = path.rfind('\\');
@@ -352,7 +378,9 @@ static std::shared_ptr<DataKeyData> MakeLocalVoiceToken(
                 .path = name + L"\\NaturalVoiceConfig",
                 .values = {
                     { L"ErrorMode", std::to_wstring(static_cast<UINT>(errorMode)) },
-                    { L"Path", std::move(path) }
+                    { L"Path", std::move(path) },
+                    // 使用动态解析出的凭证名称和值 (License 或 Key)
+                    { std::move(credName), std::move(credValue) }
                 }
             } }
         }
