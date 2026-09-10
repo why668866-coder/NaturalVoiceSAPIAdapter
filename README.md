@@ -1,7 +1,12 @@
 # NaturalVoiceSAPIAdapter
 
-我在尝试将微软新的语音包加入进支持列表中。欢迎讨论！
+我成功将微软新的语音包加入进支持列表中。欢迎讨论！
+在https://nvda.ru/sintezatory-rechi-microsoft-neural-voices-dlja-nvda网站下载语音包
+将其当做压缩包解压，然后将SynthModel.license文件放在data文件夹中的语音包目录下
+其余的跟官方一样的使用
 
+
+## 一下为官方文档
 连接 [Azure AI 语音服务][3]，使第三方程序也能使用微软[自然语音][2]的 [SAPI 5 TTS 引擎][1]。支持如下自然语音：
 
 - Windows 11 中的讲述人自然语音
