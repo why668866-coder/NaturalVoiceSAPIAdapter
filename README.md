@@ -1,8 +1,8 @@
 # NaturalVoiceSAPIAdapter
 
 我成功将微软新的语音包加入进支持列表中。欢迎讨论！
-在https://nvda.ru/sintezatory-rechi-microsoft-neural-voices-dlja-nvda网站下载语音包
-将其当做压缩包解压，然后将SynthModel.license文件放在data文件夹中的语音包目录下
+在https://nvda.ru/sintezatory-rechi-microsoft-neural-voices-dlja-nvda
+下载语音包，将.nvda-addon文件当作压缩包解压，然后将SynthModel.license文件放在data文件夹中的语音包目录下
 其余的跟官方一样的使用
 
 
